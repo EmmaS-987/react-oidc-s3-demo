@@ -1,0 +1,89 @@
+name: SalsaGate (CRA deploy)
+
+on:
+  push:
+    branches: [ "tamper_demo" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  BUILD_DIR: build
+
+jobs:
+  build:
+    name: Build & Package (CRA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build (CRA)
+        run: npm run build
+
+      - name: Create integrity manifest
+        run: |
+          cd $BUILD_DIR
+          find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > ../checksums.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build
+          path: |
+            ${{ env.BUILD_DIR }}/
+            checksums.sha256
+          if-no-files-found: error
+
+  approve_and_deploy:
+    name: Manual Approval → Upload to S3
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: demo
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1' }}
+      S3_BUCKET:  ${{ vars.S3_BUCKET  != '' && vars.S3_BUCKET  || 'my-react-cra-demo-123456' }}
+
+    steps:
+      - name: Show resolved vars (debug)
+        run: |
+          echo "vars.AWS_REGION='${{ vars.AWS_REGION }}'"
+          echo "env.AWS_REGION='$AWS_REGION'"
+          echo "vars.S3_BUCKET='${{ vars.S3_BUCKET }}'"
+          echo "env.S3_BUCKET='$S3_BUCKET'"
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: react-build
+          path: dl
+
+      - name: Verify integrity (optional)
+        run: |
+          cd dl
+          shasum -a 256 -c checksums.sha256
+
+      - name: Deploy to S3 (sync)
+        run: |
+          aws s3 sync "dl/${{ env.BUILD_DIR }}" "s3://$S3_BUCKET/" --delete
+          echo "Deployed to s3://$S3_BUCKET/"
+
