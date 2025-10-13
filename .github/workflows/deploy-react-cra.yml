@@ -79,8 +79,8 @@ jobs:
 
       - name: Verify integrity (optional)
         run: |
-          cd dl
-          shasum -a 256 -c checksums.sha256
+          cd dl/${{ env.BUILD_DIR }}
+          shasum -a 256 -c ../checksums.sha256
 
       - name: Deploy to S3 (sync)
         run: |
