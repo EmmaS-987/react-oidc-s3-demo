@@ -11,11 +11,16 @@ permissions:
 
 env:
   BUILD_DIR: build
+  AWS_REGION: us-east-1
+  S3_BUCKET: tamper-demo-react-app
 
 jobs:
   build:
-    name: Build & Package (CRA)
+    name: Build & Stage (CRA)
     runs-on: ubuntu-latest
+    outputs:
+      staging_uri: ${{ steps.staging-info.outputs.staging_uri }}
+      staging_path: ${{ steps.staging-info.outputs.staging_path }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,18 +30,18 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install deps
+      - name: Install dependencies
         run: npm ci
 
       - name: Build (CRA)
         run: npm run build
 
-      - name: Create integrity manifest
+      - name: Create integrity manifest (optional)
         run: |
           cd $BUILD_DIR
           find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > ../checksums.sha256
 
-      - name: Upload artifact
+      - name: Upload artifact (for record)
         uses: actions/upload-artifact@v4
         with:
           name: react-build
@@ -45,8 +50,31 @@ jobs:
             checksums.sha256
           if-no-files-found: error
 
+      # ---------- NEW: define the per-run staging folder ----------
+      - name: Compute staging folder for this run
+        id: staging-info
+        run: |
+          STAGING_PATH="_staging/${{ github.run_id }}/"
+          echo "staging_path=$STAGING_PATH" >> "$GITHUB_OUTPUT"
+          echo "staging_uri=s3://${{ env.S3_BUCKET }}/${STAGING_PATH}" >> "$GITHUB_OUTPUT"
+
+      # ---------- NEW: upload build output to staging --------------
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stage build to S3 (pre-approval)
+        run: |
+          DEST="s3://${{ env.S3_BUCKET }}/${{ steps.staging-info.outputs.staging_path }}"
+          echo "Staging to: $DEST"
+          aws s3 sync "${{ env.BUILD_DIR }}/" "$DEST" --delete
+          echo "✅ Build staged to S3"
+          aws s3 ls "$DEST" --recursive
+
   approve_and_deploy:
-    name: Manual Approval → Upload to S3
+    name: Manual Approval → Promote staging to site
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -54,36 +82,29 @@ jobs:
       url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
     env:
-      AWS_REGION: ${{ vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1' }}
-      S3_BUCKET:  ${{ vars.S3_BUCKET  != '' && vars.S3_BUCKET  || 'my-react-cra-demo-123456' }}
+      AWS_REGION: us-east-1
+      S3_BUCKET: tamper-demo-react-app
 
     steps:
-      - name: Show resolved vars (debug)
-        run: |
-          echo "vars.AWS_REGION='${{ vars.AWS_REGION }}'"
-          echo "env.AWS_REGION='$AWS_REGION'"
-          echo "vars.S3_BUCKET='${{ vars.S3_BUCKET }}'"
-          echo "env.S3_BUCKET='$S3_BUCKET'"
-
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: react-build
-          path: dl
-
-      - name: Verify integrity (optional)
+      - name: Show staging location
         run: |
-          cd dl/${{ env.BUILD_DIR }}
-          shasum -a 256 -c ../checksums.sha256
+          echo "Staging path:   ${{ needs.build.outputs.staging_path }}"
+          echo "Staging URI:    ${{ needs.build.outputs.staging_uri }}"
+          echo "Website bucket: s3://$S3_BUCKET/"
 
-      - name: Deploy to S3 (sync)
+      - name: List staged files
         run: |
-          aws s3 sync "dl/${{ env.BUILD_DIR }}" "s3://$S3_BUCKET/" --delete
-          echo "Deployed to s3://$S3_BUCKET/"
+          aws s3 ls "s3://$S3_BUCKET/${{ needs.build.outputs.staging_path }}" --recursive
 
+      - name: Promote staging → website root
+        run: |
+          echo "Promoting from staging to website root..."
+          aws s3 sync "s3://$S3_BUCKET/${{ needs.build.outputs.staging_path }}" "s3://$S3_BUCKET/" --delete
+          echo "✅ Promotion complete. Site now live:"
+          echo "http://$S3_BUCKET.s3-website-$AWS_REGION.amazonaws.com"
