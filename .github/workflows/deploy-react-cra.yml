@@ -53,7 +53,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Stage the build to a per-run folder
+      # Stage the build to a per-run folder for optional manual edits
       - name: Stage build to S3 (pre-approval)
         run: |
           STAGING_PATH="_staging/${{ github.run_id }}/"
@@ -74,7 +74,6 @@ jobs:
     env:
       AWS_REGION: us-east-1
       S3_BUCKET: tamper-demo-react-app
-      BUILD_DIR: build
 
     steps:
       - name: Configure AWS (OIDC)
@@ -83,55 +82,38 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Recompute the same staging path we used in build
       - name: Show staging location
-        id: where
         run: |
-          echo "STAGING_PATH=_staging/${{ github.run_id }}/" >> "$GITHUB_OUTPUT"
           echo "Staging path: _staging/${{ github.run_id }}/"
-          echo "Staging URI:  s3://${{ env.S3_BUCKET }}/_staging/${{ github.run_id }}/"
+          echo "Staging URI:  s3://$S3_BUCKET/_staging/${{ github.run_id }}/"
 
       - name: List staged files
         run: |
-          aws s3 ls "s3://$S3_BUCKET/${{ steps.where.outputs.STAGING_PATH }}" --recursive || true
+          aws s3 ls "s3://$S3_BUCKET/_staging/${{ github.run_id }}/" --recursive || true
 
-      # If staging is empty (no files), repopulate from artifact so deploy still works.
-      - name: Ensure staging has content (fallback to artifact if empty)
+      # SAFE PROMOTION: dry-run + guardrail to ensure direction is STAGING -> ROOT
+      - name: Promote staging → website root (safe)
         run: |
           set -euo pipefail
-          STAGING_URI="s3://$S3_BUCKET/${{ steps.where.outputs.STAGING_PATH }}"
-          COUNT=$(aws s3 ls "$STAGING_URI" --recursive | wc -l | tr -d ' ')
-          echo "Staging file count: $COUNT"
-          if [ "$COUNT" -eq "0" ]; then
-            echo "⚠️ Staging is empty. Falling back to build artifact."
-            mkdir -p dl
-            echo "Downloading artifact..."
-            gh release -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
-          fi
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
 
-      # Safer artifact fallback: download the artifact and publish directly if staging is empty
-      - name: Download artifact (for fallback)
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          name: react-build
-          path: dl
+          STAGING_PATH="_staging/${{ github.run_id }}/"
+          SRC="s3://$S3_BUCKET/${STAGING_PATH}"
+          DST="s3://$S3_BUCKET/"
 
-      - name: Promote to website root
-        run: |
-          set -euo pipefail
-          STAGING_URI="s3://$S3_BUCKET/${{ steps.where.outputs.STAGING_PATH }}"
-          COUNT=$(aws s3 ls "$STAGING_URI" --recursive | wc -l | tr -d ' ')
-          if [ "$COUNT" -gt "0" ]; then
-            echo "Promoting from STAGING → root"
-            aws s3 sync "$STAGING_URI" "s3://$S3_BUCKET/" --delete
-          else
-            echo "Promoting from ARTIFACT → root (staging was empty)"
-            aws s3 sync "dl/${{ env.BUILD_DIR }}" "s3://$S3_BUCKET/" --delete
+          echo "SOURCE (must be STAGING): $SRC"
+          echo "DEST   (must be ROOT):    $DST"
+          echo
+          echo "Preview (dry-run):"
+          aws s3 sync "$SRC" "$DST" --delete --exact-timestamps --dryrun || true
+          echo
+
+          # Abort if any planned delete touches _staging/ (indicates reversed args)
+          if aws s3 sync "$SRC" "$DST" --delete --exact-timestamps --dryrun | grep -q '_staging/'; then
+            echo "❌ Safety check failed: planned deletes under _staging/. Aborting."
+            exit 1
           fi
 
-          echo "✅ Promotion complete. Site now live:"
+          echo "Running real sync…"
+          aws s3 sync "$SRC" "$DST" --delete --exact-timestamps
+          echo "✅ Promotion complete. Live site:"
           echo "http://$S3_BUCKET.s3-website-$AWS_REGION.amazonaws.com"
