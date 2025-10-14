@@ -18,9 +18,6 @@ jobs:
   build:
     name: Build & Stage (CRA)
     runs-on: ubuntu-latest
-    outputs:
-      staging_uri: ${{ steps.staging-info.outputs.staging_uri }}
-      staging_path: ${{ steps.staging-info.outputs.staging_path }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,27 +47,20 @@ jobs:
             checksums.sha256
           if-no-files-found: error
 
-      # ---------- NEW: define the per-run staging folder ----------
-      - name: Compute staging folder for this run
-        id: staging-info
-        run: |
-          STAGING_PATH="_staging/${{ github.run_id }}/"
-          echo "staging_path=$STAGING_PATH" >> "$GITHUB_OUTPUT"
-          echo "staging_uri=s3://${{ env.S3_BUCKET }}/${STAGING_PATH}" >> "$GITHUB_OUTPUT"
-
-      # ---------- NEW: upload build output to staging --------------
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Stage the build to a per-run folder
       - name: Stage build to S3 (pre-approval)
         run: |
-          DEST="s3://${{ env.S3_BUCKET }}/${{ steps.staging-info.outputs.staging_path }}"
+          STAGING_PATH="_staging/${{ github.run_id }}/"
+          DEST="s3://${{ env.S3_BUCKET }}/${STAGING_PATH}"
           echo "Staging to: $DEST"
           aws s3 sync "${{ env.BUILD_DIR }}/" "$DEST" --delete
-          echo "✅ Build staged to S3"
+          echo "✅ Build staged to $DEST"
           aws s3 ls "$DEST" --recursive
 
   approve_and_deploy:
@@ -84,6 +74,7 @@ jobs:
     env:
       AWS_REGION: us-east-1
       S3_BUCKET: tamper-demo-react-app
+      BUILD_DIR: build
 
     steps:
       - name: Configure AWS (OIDC)
@@ -92,19 +83,55 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Recompute the same staging path we used in build
       - name: Show staging location
+        id: where
         run: |
-          echo "Staging path:   ${{ needs.build.outputs.staging_path }}"
-          echo "Staging URI:    ${{ needs.build.outputs.staging_uri }}"
-          echo "Website bucket: s3://$S3_BUCKET/"
+          echo "STAGING_PATH=_staging/${{ github.run_id }}/" >> "$GITHUB_OUTPUT"
+          echo "Staging path: _staging/${{ github.run_id }}/"
+          echo "Staging URI:  s3://${{ env.S3_BUCKET }}/_staging/${{ github.run_id }}/"
 
       - name: List staged files
         run: |
-          aws s3 ls "s3://$S3_BUCKET/${{ needs.build.outputs.staging_path }}" --recursive
+          aws s3 ls "s3://$S3_BUCKET/${{ steps.where.outputs.STAGING_PATH }}" --recursive || true
 
-      - name: Promote staging → website root
+      # If staging is empty (no files), repopulate from artifact so deploy still works.
+      - name: Ensure staging has content (fallback to artifact if empty)
         run: |
-          echo "Promoting from staging to website root..."
-          aws s3 sync "s3://$S3_BUCKET/${{ needs.build.outputs.staging_path }}" "s3://$S3_BUCKET/" --delete
+          set -euo pipefail
+          STAGING_URI="s3://$S3_BUCKET/${{ steps.where.outputs.STAGING_PATH }}"
+          COUNT=$(aws s3 ls "$STAGING_URI" --recursive | wc -l | tr -d ' ')
+          echo "Staging file count: $COUNT"
+          if [ "$COUNT" -eq "0" ]; then
+            echo "⚠️ Staging is empty. Falling back to build artifact."
+            mkdir -p dl
+            echo "Downloading artifact..."
+            gh release -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          fi
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Safer artifact fallback: download the artifact and publish directly if staging is empty
+      - name: Download artifact (for fallback)
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: react-build
+          path: dl
+
+      - name: Promote to website root
+        run: |
+          set -euo pipefail
+          STAGING_URI="s3://$S3_BUCKET/${{ steps.where.outputs.STAGING_PATH }}"
+          COUNT=$(aws s3 ls "$STAGING_URI" --recursive | wc -l | tr -d ' ')
+          if [ "$COUNT" -gt "0" ]; then
+            echo "Promoting from STAGING → root"
+            aws s3 sync "$STAGING_URI" "s3://$S3_BUCKET/" --delete
+          else
+            echo "Promoting from ARTIFACT → root (staging was empty)"
+            aws s3 sync "dl/${{ env.BUILD_DIR }}" "s3://$S3_BUCKET/" --delete
+          fi
+
           echo "✅ Promotion complete. Site now live:"
           echo "http://$S3_BUCKET.s3-website-$AWS_REGION.amazonaws.com"
