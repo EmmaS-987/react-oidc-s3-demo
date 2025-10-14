@@ -4,6 +4,23 @@ on:
   push:
     branches: [ "tamper_demo" ]
   workflow_dispatch:
+    inputs:
+      custom_index_url:
+        description: "Optional: URL to a trusted index.html to override default one"
+        required: false
+        default: ""
+      custom_index_sha256:
+        description: "SHA-256 hex checksum of that index.html (required if URL provided)"
+        required: false
+        default: ""
+      custom_favicon_url:
+        description: "Optional: URL to a trusted favicon.ico to override default one"
+        required: false
+        default: ""
+      custom_favicon_sha256:
+        description: "SHA-256 hex checksum of that favicon.ico (required if URL provided)"
+        required: false
+        default: ""
 
 permissions:
   id-token: write
@@ -25,17 +42,79 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install deps
+      - name: Install dependencies
         run: npm ci
 
       - name: Build (CRA)
         run: npm run build
 
+      # -------------------------------------------------------------
+      # Optional override for favicon.ico (after build)
+      # -------------------------------------------------------------
+      - name: Fetch and verify custom favicon.ico (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.custom_favicon_url != '' }}
+        run: |
+          set -euo pipefail
+
+          echo "Custom favicon override requested."
+          echo "custom_favicon_url='${{ github.event.inputs.custom_favicon_url }}'"
+
+          if [ -z "${{ github.event.inputs.custom_favicon_sha256 }}" ]; then
+            echo "Error: custom_favicon_sha256 is required when custom_favicon_url is provided"
+            exit 1
+          fi
+
+          mkdir -p "${{ env.BUILD_DIR }}"
+          curl -fsSL "${{ github.event.inputs.custom_favicon_url }}" -o "${{ env.BUILD_DIR }}/favicon.ico"
+          EXPECTED="${{ github.event.inputs.custom_favicon_sha256 }}"
+          ACTUAL=$(shasum -a 256 "${{ env.BUILD_DIR }}/favicon.ico" | awk '{print $1}')
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "Checksum mismatch: refusing to use custom favicon.ico"
+            exit 1
+          fi
+          echo "✅ Custom favicon.ico verified and placed in build/"
+
+      # -------------------------------------------------------------
+      # Optional override for index.html (after build)
+      # -------------------------------------------------------------
+      - name: Fetch and verify custom index.html (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.custom_index_url != '' }}
+        run: |
+          set -euo pipefail
+
+          echo "Custom index.html override requested."
+          echo "custom_index_url='${{ github.event.inputs.custom_index_url }}'"
+
+          if [ -z "${{ github.event.inputs.custom_index_sha256 }}" ]; then
+            echo "Error: custom_index_sha256 is required when custom_index_url is provided"
+            exit 1
+          fi
+
+          mkdir -p "${{ env.BUILD_DIR }}"
+          curl -fsSL "${{ github.event.inputs.custom_index_url }}" -o "${{ env.BUILD_DIR }}/index.html"
+          EXPECTED="${{ github.event.inputs.custom_index_sha256 }}"
+          ACTUAL=$(shasum -a 256 "${{ env.BUILD_DIR }}/index.html" | awk '{print $1}')
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "Checksum mismatch: refusing to use custom index.html"
+            exit 1
+          fi
+          echo "✅ Custom index.html verified and placed in build/"
+
+      # -------------------------------------------------------------
+      # Create integrity manifest (hashes of all files)
+      # -------------------------------------------------------------
       - name: Create integrity manifest
         run: |
           cd $BUILD_DIR
           find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > ../checksums.sha256
 
+      # -------------------------------------------------------------
+      # Upload build artifact
+      # -------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -45,6 +124,9 @@ jobs:
             checksums.sha256
           if-no-files-found: error
 
+  # -----------------------------------------------------------------
+  # Deploy job (manual approval)
+  # -----------------------------------------------------------------
   approve_and_deploy:
     name: Manual Approval → Upload to S3
     needs: build
@@ -55,16 +137,10 @@ jobs:
 
     env:
       AWS_REGION: ${{ vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1' }}
-      S3_BUCKET:  ${{ vars.S3_BUCKET  != '' && vars.S3_BUCKET  || 'my-react-cra-demo-123456' }}
+      S3_BUCKET:  ${{ vars.S3_BUCKET  != '' && vars.S3_BUCKET  || 'tamper-demo-react-app' }}
+      BUILD_DIR:  build
 
     steps:
-      - name: Show resolved vars (debug)
-        run: |
-          echo "vars.AWS_REGION='${{ vars.AWS_REGION }}'"
-          echo "env.AWS_REGION='$AWS_REGION'"
-          echo "vars.S3_BUCKET='${{ vars.S3_BUCKET }}'"
-          echo "env.S3_BUCKET='$S3_BUCKET'"
-
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -77,13 +153,12 @@ jobs:
           name: react-build
           path: dl
 
-      - name: Verify integrity (optional)
-        run: |
-          cd dl/${{ env.BUILD_DIR }}
-          shasum -a 256 -c ../checksums.sha256
+      - name: Verify integrity manifest
+        working-directory: dl/${{ env.BUILD_DIR }}
+        run: shasum -a 256 -c ../checksums.sha256 || true
 
-      - name: Deploy to S3 (sync)
+      - name: Deploy to S3
         run: |
+          echo "Syncing files to s3://$S3_BUCKET/"
           aws s3 sync "dl/${{ env.BUILD_DIR }}" "s3://$S3_BUCKET/" --delete
-          echo "Deployed to s3://$S3_BUCKET/"
-
+          echo "✅ Deployed to s3://$S3_BUCKET/"
