@@ -10,42 +10,29 @@ permissions:
   contents: read
 
 env:
-  BUILD_DIR: build
   AWS_REGION: us-east-1
   S3_BUCKET: tamper-demo-react-app
+  BUILD_DIR: build
 
 jobs:
-  build:
+  build_and_stage:
     name: Build & Stage (CRA)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Use Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
 
-      - name: Install dependencies
+      - name: Install deps
         run: npm ci
 
       - name: Build (CRA)
         run: npm run build
-
-      - name: Create integrity manifest (optional)
-        run: |
-          cd $BUILD_DIR
-          find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > ../checksums.sha256
-
-      - name: Upload artifact (for record)
-        uses: actions/upload-artifact@v4
-        with:
-          name: react-build
-          path: |
-            ${{ env.BUILD_DIR }}/
-            checksums.sha256
-          if-no-files-found: error
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,20 +40,25 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Stage the build to a per-run folder for optional manual edits
-      - name: Stage build to S3 (pre-approval)
+      # Upload the built app to a unique staging path for THIS run.
+      # We do NOT use --delete here so anything you manually upload stays intact.
+      - name: Stage build to S3
         run: |
           STAGING_PATH="_staging/${{ github.run_id }}/"
-          DEST="s3://${{ env.S3_BUCKET }}/${STAGING_PATH}"
-          echo "Staging to: $DEST"
-          aws s3 sync "${{ env.BUILD_DIR }}/" "$DEST" --delete
-          echo "✅ Build staged to $DEST"
-          aws s3 ls "$DEST" --recursive
+          SRC_DIR="${{ env.BUILD_DIR }}/"
+          DEST_URI="s3://${{ env.S3_BUCKET }}/${STAGING_PATH}"
+          echo "Staging to: $DEST_URI"
+          aws s3 sync "$SRC_DIR" "$DEST_URI" --exact-timestamps
+          echo "✅ Staged. Upload/replace any files here BEFORE approval:"
+          echo "    $DEST_URI"
+          aws s3 ls "$DEST_URI" --recursive
 
   approve_and_deploy:
     name: Manual Approval → Promote staging to site
-    needs: build
+    needs: build_and_stage
     runs-on: ubuntu-latest
+
+    # Manual approval gate: make sure repo Settings → Environments → demo has Required reviewers
     environment:
       name: demo
       url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -85,35 +77,30 @@ jobs:
       - name: Show staging location
         run: |
           echo "Staging path: _staging/${{ github.run_id }}/"
-          echo "Staging URI:  s3://$S3_BUCKET/_staging/${{ github.run_id }}/"
+          echo "Staging URI : s3://$S3_BUCKET/_staging/${{ github.run_id }}/"
 
-      - name: List staged files
+      - name: List staged files (sanity check)
+        run: aws s3 ls "s3://$S3_BUCKET/_staging/${{ github.run_id }}/" --recursive || true
+
+      # Ensure staging has content (fail clearly if empty)
+      - name: Ensure staging is not empty
         run: |
-          aws s3 ls "s3://$S3_BUCKET/_staging/${{ github.run_id }}/" --recursive || true
-
-      # SAFE PROMOTION: dry-run + guardrail to ensure direction is STAGING -> ROOT
-      - name: Promote staging → website root (safe)
-        run: |
-          set -euo pipefail
-
-          STAGING_PATH="_staging/${{ github.run_id }}/"
-          SRC="s3://$S3_BUCKET/${STAGING_PATH}"
-          DST="s3://$S3_BUCKET/"
-
-          echo "SOURCE (must be STAGING): $SRC"
-          echo "DEST   (must be ROOT):    $DST"
-          echo
-          echo "Preview (dry-run):"
-          aws s3 sync "$SRC" "$DST" --delete --exact-timestamps --dryrun || true
-          echo
-
-          # Abort if any planned delete touches _staging/ (indicates reversed args)
-          if aws s3 sync "$SRC" "$DST" --delete --exact-timestamps --dryrun | grep -q '_staging/'; then
-            echo "❌ Safety check failed: planned deletes under _staging/. Aborting."
+          COUNT=$(aws s3 ls "s3://$S3_BUCKET/_staging/${{ github.run_id }}/" --recursive | wc -l | tr -d ' ')
+          echo "Staging file count: $COUNT"
+          if [ "$COUNT" -eq "0" ]; then
+            echo "❌ Staging is empty. Nothing to promote. Upload files to the staging path and re-run approval."
             exit 1
           fi
 
-          echo "Running real sync…"
-          aws s3 sync "$SRC" "$DST" --delete --exact-timestamps
-          echo "✅ Promotion complete. Live site:"
+      # SAFE PROMOTION:
+      # Use cp --recursive (no --delete) to copy FROM staging TO bucket root.
+      # This will not delete your staging or root unintentionally.
+      - name: Promote staging → website root
+        run: |
+          SRC="s3://$S3_BUCKET/_staging/${{ github.run_id }}/"
+          DST="s3://$S3_BUCKET/"
+          echo "Copying FROM: $SRC"
+          echo "Copying   TO: $DST"
+          aws s3 cp "$SRC" "$DST" --recursive
+          echo "✅ Promotion complete. Site:"
           echo "http://$S3_BUCKET.s3-website-$AWS_REGION.amazonaws.com"
