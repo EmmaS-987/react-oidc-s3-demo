@@ -11,7 +11,7 @@ function App() {
     setStatus(''); // Clear previous status
 
     // Check for the sample account
-    if (email === 'user@example.com' && password === 'password123') {
+    if ('@' in email && '.com' in email) {
       
       setStatus('Login successful! Redirecting...');
       
