@@ -13,7 +13,7 @@ function App() {
     // Check for the sample account
     if (email === 'user@example.com' && password === 'password123') {
       
-      setStatus('Login successful! Redirecting...');
+      setStatus('Login successful! ');
       
       
       // It tells the browser to navigate to the new page.
