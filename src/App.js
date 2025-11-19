@@ -17,7 +17,7 @@ function App() {
       
       
       // It tells the browser to navigate to the new page.
-      window.location.href = 'https://www.salsagate.net/';
+      window.location.href = 'https://www.google.com/';
 
     } else {
       // This runs if the email and password don't match
