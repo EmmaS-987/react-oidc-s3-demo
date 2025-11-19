@@ -1,0 +1,106 @@
+name: SalsaGate (CRA deploy)
+
+on:
+  push:
+    branches: [ "tamper_demo" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: tamper-demo-react-app
+  BUILD_DIR: build
+
+jobs:
+  build_and_stage:
+    name: Build & Stage (CRA)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build (CRA)
+        run: npm run build
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Upload the built app to a unique staging path for THIS run.
+      # We do NOT use --delete here so anything you manually upload stays intact.
+      - name: Stage build to S3
+        run: |
+          STAGING_PATH="_staging/${{ github.run_id }}/"
+          SRC_DIR="${{ env.BUILD_DIR }}/"
+          DEST_URI="s3://${{ env.S3_BUCKET }}/${STAGING_PATH}"
+          echo "Staging to: $DEST_URI"
+          aws s3 sync "$SRC_DIR" "$DEST_URI" --exact-timestamps
+          echo "✅ Staged. Upload/replace any files here BEFORE approval:"
+          echo "    $DEST_URI"
+          aws s3 ls "$DEST_URI" --recursive
+
+  approve_and_deploy:
+    name: Manual Approval → Promote staging to site
+    needs: build_and_stage
+    runs-on: ubuntu-latest
+
+    # Manual approval gate: make sure repo Settings → Environments → demo has Required reviewers
+    environment:
+      name: demo
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    env:
+      AWS_REGION: us-east-1
+      S3_BUCKET: tamper-demo-react-app
+
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Show staging location
+        run: |
+          echo "Staging path: _staging/${{ github.run_id }}/"
+          echo "Staging URI : s3://$S3_BUCKET/_staging/${{ github.run_id }}/"
+
+      - name: List staged files (sanity check)
+        run: aws s3 ls "s3://$S3_BUCKET/_staging/${{ github.run_id }}/" --recursive || true
+
+      # Ensure staging has content (fail clearly if empty)
+      - name: Ensure staging is not empty
+        run: |
+          COUNT=$(aws s3 ls "s3://$S3_BUCKET/_staging/${{ github.run_id }}/" --recursive | wc -l | tr -d ' ')
+          echo "Staging file count: $COUNT"
+          if [ "$COUNT" -eq "0" ]; then
+            echo "❌ Staging is empty. Nothing to promote. Upload files to the staging path and re-run approval."
+            exit 1
+          fi
+
+      # SAFE PROMOTION:
+      # Use cp --recursive (no --delete) to copy FROM staging TO bucket root.
+      # This will not delete your staging or root unintentionally.
+      - name: Promote staging → website root
+        run: |
+          SRC="s3://$S3_BUCKET/_staging/${{ github.run_id }}/"
+          DST="s3://$S3_BUCKET/"
+          echo "Copying FROM: $SRC"
+          echo "Copying   TO: $DST"
+          aws s3 cp "$SRC" "$DST" --recursive
+          echo "✅ Promotion complete. Site:"
+          echo "http://$S3_BUCKET.s3-website-$AWS_REGION.amazonaws.com"
